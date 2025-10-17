@@ -1,11 +1,236 @@
 <!doctype html>
 <html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <title>My First GitHub Page</title>
-</head>
-<body>
-  <h1>Hello GitHub Pages!</h1>
-  <p>これはテストページです。</p>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AR×IoT Smart Tag (BLE) – Hiro Marker</title>
+
+    <!-- A-Frame / AR.js -->
+    <script src="https://aframe.io/releases/1.0.4/aframe.min.js"></script>
+    <script src="https://raw.githack.com/AR-js-org/AR.js/master/aframe/build/aframe-ar.js"></script>
+
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+      .ui {
+        position: fixed; left: 12px; top: 12px; display: flex; gap: 8px; flex-wrap: wrap;
+        z-index: 10; font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      .ui button, .ui select {
+        padding: 8px 10px; border-radius: 10px; border: 0; cursor: pointer; background: #111; color: #fff;
+        box-shadow: 0 4px 12px rgba(0,0,0,.25);
+      }
+      .ui button[disabled] { opacity: .5; cursor: not-allowed; }
+      .hint { position: fixed; left: 12px; bottom: 12px; background: rgba(0,0,0,.55); color: #fff;
+        padding: 8px 10px; border-radius: 8px; font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+      .hint a { color: #9ad; text-decoration: underline; }
+    </style>
+  </head>
+
+  <body>
+    <div class="ui">
+      <button id="btnConnect">BLE接続</button>
+      <button id="btnToggle" disabled>LED トグル</button>
+      <button id="btnDemo">デモ開始/停止</button>
+      <select id="sensorPreset" title="表示するセンサの想定">
+        <option value="plant" selected>Plant（温度/湿度/土壌水分）</option>
+        <option value="room">Room（温度/湿度/CO₂）</option>
+      </select>
+    </div>
+
+    <a-scene embedded arjs>
+		<a-marker type="pattern" url="marker_list/pattern-shikaku.patt">
+		<a-entity id="board" rotation="-90 0 270" position="0 0 0.002">
+
+			<a-plane position="0 0 0" width="1.6" height="1.2"
+					color="#101418" opacity="0.85"></a-plane>
+
+			<a-text value="AR×IoT Smart Tag" position="0 0.52 0.001"
+					align="center" color="#FFFFFF" width="2.5"></a-text>
+
+			<a-text id="t1" value="T: --.- °C" position="-0.72 0.32 0.001"
+					color="#C8F7FF" width="2.2"></a-text>
+			<a-text id="t2" value="H: -- %" position="-0.72 0.17 0.001"
+					color="#C8FFC8" width="2.2"></a-text>
+			<a-text id="t3" value="Soil: -- %" position="-0.72 0.02 0.001"
+					color="#FFD6A5" width="2.2"></a-text>
+
+			<a-text id="status" value="Status: idle" position="-0.72 -0.18 0.001"
+					color="#FFFFFF" width="2.0"></a-text>
+
+			<a-entity id="meter" position="0.55 0.1 0.001">
+			<a-cylinder height="0.05" radius="0.6" rotation="0 0 90" color="#223"></a-cylinder>
+			<a-box id="needle" depth="0.02" height="0.04" width="0.6" position="0 0.1 0.01" color="#4CC3D9"
+					animation__rot="property: rotation; dir: alternate; loop: true; dur: 3000; to: 0 0 6; from: 0 0 -6;"></a-box>
+			</a-entity>
+
+		</a-entity>
+		</a-marker>
+
+      <a-entity camera></a-entity>
+    </a-scene>
+
+    <div class="hint">
+      Hiroマーカ画像：
+      <a href="https://upload.wikimedia.org/wikipedia/commons/4/48/Hiro_marker_ARjs.png" target="_blank" rel="noopener">開く</a>
+      ／ 使い方：左上の「BLE接続」からデバイスを選択 → 値がAR上に出ます（https必須）
+    </div>
+
+    <script>
+      const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+      const RX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
+      const TX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+      const t1 = document.getElementById('t1');
+      const t2 = document.getElementById('t2');
+      const t3 = document.getElementById('t3');
+      const statusText = document.getElementById('status');
+      const needle = document.getElementById('needle');
+
+      const btnConnect = document.getElementById('btnConnect');
+      const btnToggle  = document.getElementById('btnToggle');
+      const btnDemo    = document.getElementById('btnDemo');
+      const sensorPreset = document.getElementById('sensorPreset');
+
+      let bleDevice = null;
+      let rxChar = null; // Notify受信用
+      let txChar = null; // Write用
+      let connected = false;
+      let ledOn = false;
+      let demoTimer = null;
+
+      function setStatus(msg) {
+        statusText.setAttribute('value', 'Status: ' + msg);
+      }
+
+      function parseLine(line) {
+        const m = Object.fromEntries(line.split(',').map(p => p.split(':').map(s => s.trim())));
+        return m;
+      }
+
+      function updateUIFromData(map) {
+        const preset = sensorPreset.value;
+        if (preset === 'plant') {
+          const T = Number(map.T ?? map.Temp ?? 0);
+          const H = Number(map.H ?? map.Humid ?? 0);
+          const S = Number(map.Soil ?? map.Moist ?? 0);
+          t1.setAttribute('value', `T: ${T.toFixed(1)} °C`);
+          t2.setAttribute('value', `H: ${H.toFixed(0)} %`);
+          t3.setAttribute('value', `Soil: ${S.toFixed(0)} %`);
+          const angle = -45 + Math.max(0, Math.min(50, T)) * (90 / 50);
+          needle.setAttribute('rotation', `0 0 ${angle}`);
+        } else {
+          const T = Number(map.T ?? map.Temp ?? 0);
+          const H = Number(map.H ?? map.Humid ?? 0);
+          const C = Number(map.CO2 ?? 0);
+          t1.setAttribute('value', `T: ${T.toFixed(1)} °C`);
+          t2.setAttribute('value', `H: ${H.toFixed(0)} %`);
+          t3.setAttribute('value', `CO₂: ${C.toFixed(0)} ppm`);
+          const cClamped = Math.max(400, Math.min(2000, C));
+          const angle = -45 + (cClamped - 400) * (90 / (2000 - 400));
+          needle.setAttribute('rotation', `0 0 ${angle}`);
+        }
+      }
+
+      // ====== デモデータ（BLEなしでも見栄え確認用） ======
+      function startDemo() {
+        if (demoTimer) { stopDemo(); return; }
+        setStatus('demo running');
+        let t = 22.5, h = 45, s = 60, c = 700;
+        demoTimer = setInterval(() => {
+          t += (Math.random() - 0.5) * 0.2;
+          h += (Math.random() - 0.5) * 1.0;
+          s += (Math.random() - 0.5) * 1.2;
+          c += (Math.random() - 0.5) * 15;
+          const map = (sensorPreset.value === 'plant') ? { T: t, H: h, Soil: s } : { T: t, H: h, CO2: c };
+          updateUIFromData(map);
+        }, 800);
+      }
+      function stopDemo() {
+        clearInterval(demoTimer);
+        demoTimer = null;
+        setStatus('idle');
+      }
+      btnDemo.addEventListener('click', () => { if (demoTimer) stopDemo(); else startDemo(); });
+
+      // ====== Web Bluetooth ======
+      async function connectBLE() {
+        try {
+          setStatus('requesting device...');
+          bleDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [SERVICE_UUID] }]
+          });
+          setStatus('connecting...');
+          const server = await bleDevice.gatt.connect();
+          const service = await server.getPrimaryService(SERVICE_UUID);
+          rxChar = await service.getCharacteristic(RX_CHAR_UUID);
+          txChar = await service.getCharacteristic(TX_CHAR_UUID);
+
+          await rxChar.startNotifications();
+          rxChar.addEventListener('characteristicvaluechanged', (event) => {
+            const value = event.target.value; // DataView
+            let text = '';
+            for (let i = 0; i < value.byteLength; i++) text += String.fromCharCode(value.getUint8(i));
+            text.split(/\r?\n/).forEach(line => {
+              line = line.trim();
+              if (!line) return;
+              const map = parseLine(line);
+              updateUIFromData(map);
+            });
+          });
+
+          connected = true;
+          setStatus('connected');
+          btnToggle.disabled = false;
+          btnConnect.textContent = '切断';
+
+          bleDevice.addEventListener('gattserverdisconnected', () => {
+            connected = false;
+            btnToggle.disabled = true;
+            btnConnect.textContent = 'BLE接続';
+            setStatus('disconnected');
+          });
+        } catch (e) {
+          console.error(e);
+          setStatus('error: ' + e.message);
+        }
+      }
+
+      async function disconnectBLE() {
+        try {
+          if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+          connected = false;
+          btnToggle.disabled = true;
+          btnConnect.textContent = 'BLE接続';
+          setStatus('disconnected');
+        } catch (e) {
+          console.error(e);
+          setStatus('error: ' + e.message);
+        }
+      }
+
+      async function toggleLED() {
+        if (!txChar) return;
+        ledOn = !ledOn;
+        const cmd = `LED:${ledOn ? 1 : 0}`;
+        const data = new TextEncoder().encode(cmd + "\n");
+        try {
+          await txChar.writeValueWithoutResponse(data);
+          setStatus('sent ' + cmd);
+        } catch (e) {
+          console.error(e);
+          setStatus('send error: ' + e.message);
+        }
+      }
+
+      btnConnect.addEventListener('click', async () => {
+        if (connected) await disconnectBLE(); else await connectBLE();
+      });
+      btnToggle.addEventListener('click', toggleLED);
+
+      // HTTPS 必須チェック
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+        setTimeout(() => setStatus('⚠ この機能は https 必須です（GitHub Pages で公開してください）'), 800);
+      }
+    </script>
+  </body>
 </html>
